@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Task Progress",
+    "description": "Shows an auto-planned task board with stage status, stage results, and overall progress in a floating card at the window edge."
+  }
+}

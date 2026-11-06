@@ -113,6 +113,48 @@ assert.equal(todoBoard.board.source, 'todo')
 assert.equal(todoBoard.board.tasks.length, 2)
 assert.equal(todoBoard.turnHadBoard, true)
 
+const activityCall = fold(afterUser, {
+  type: 'tool/call',
+  time: 1700,
+  data: { name: 'read', callId: 'call-1', arguments: JSON.stringify({ path: 'D:\\repo\\plugin\\index.js' }) },
+})
+assert.equal(activityCall.board.source, 'turn')
+assert.equal(activityCall.board.tasks.length, 1)
+assert.match(activityCall.board.tasks[0].title, /读取/)
+assert.equal(activityCall.board.tasks[0].status, 'in_progress')
+assert.equal(activityCall.turnHadBoard, false)
+
+const activityDone = fold(activityCall, {
+  type: 'tool/result',
+  time: 1750,
+  data: {
+    message: {
+      role: 'tool',
+      toolCallId: 'call-1',
+      source: { kind: 'tool', callId: 'call-1' },
+      isError: false,
+      content: [{ type: 'text', text: 'ok' }],
+    },
+  },
+})
+assert.equal(activityDone.board.tasks[0].status, 'completed')
+assert.equal(activityDone.board.tasks[0].result, '已完成')
+
+const activityAnswer = fold(activityDone, {
+  type: 'assistant/message',
+  time: 1800,
+  data: { message: { content: [{ type: 'text', text: '已读取并检查插件源码。' }] } },
+})
+const activityTurn = fold(activityAnswer, {
+  type: 'turn/end',
+  time: 1900,
+  data: { reason: { kind: 'completed' } },
+})
+assert.equal(activityTurn.board.source, 'turn')
+assert.equal(activityTurn.board.tasks.every((task) => task.status === 'completed'), true)
+assert.equal(activityTurn.board.tasks.at(-1).id, 'answer')
+assert.match(activityTurn.board.tasks.at(-1).result, /已读取/)
+
 let registered = false
 const ctx = {
   sessionProjections: {

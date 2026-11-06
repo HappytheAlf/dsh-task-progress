@@ -200,6 +200,53 @@ function turnBoard(goal, now, status, result) {
   }
 }
 
+const TOOL_LABELS = {
+  read: '读取',
+  read_image: '查看图片',
+  glob: '查找文件',
+  grep: '搜索内容',
+  edit: '修改',
+  write: '写入',
+  bash: '运行命令',
+  pwsh: '运行命令',
+  web_search: '搜索资料',
+  web_fetch: '读取网页',
+  office_open: '打开文档',
+  office_read: '读取文档',
+  office_edit: '编辑文档',
+  office_render: '渲染文档',
+  office_save: '保存文档',
+  skill: '加载技能',
+  plugin_manager: '管理插件',
+  cordis_inspect_query: '检查插件接口',
+  session_event_read: '读取会话记录',
+  task_progress: '更新任务板',
+}
+
+function fileBase(value) {
+  if (typeof value !== 'string' || value === '') return ''
+  return value.split(/[\\/]/).pop() || ''
+}
+
+function toolTitle(name, args) {
+  const label = TOOL_LABELS[name] ?? name
+  let suffix = ''
+  if (args && typeof args === 'object') {
+    suffix = fileBase(args.path) || fileBase(args.file_path)
+    if (suffix === '' && typeof args.query === 'string') suffix = text(args.query, 30)
+    if (suffix === '' && typeof args.description === 'string') suffix = text(args.description, 30)
+  }
+  return text(suffix === '' ? label : `${label} ${suffix}`, MAX_TITLE)
+}
+
+function capFallbackTasks(tasks) {
+  const limit = 8
+  if (tasks.length <= limit) return tasks
+  const active = tasks.filter((task) => task.status !== 'completed')
+  const completed = tasks.filter((task) => task.status === 'completed')
+  return [...completed.slice(-Math.max(0, limit - active.length)), ...active].slice(-limit)
+}
+
 /** Fold one committed Session event into the board projection. */
 export function fold(state, event) {
   if (event.type === 'user/message') {
@@ -207,10 +254,14 @@ export function fold(state, event) {
     if (nextGoal === '') return state
     const previousComplete =
       state.board === null || state.board.tasks.every((task) => task.status === 'completed')
+    const preserve =
+      state.board !== null &&
+      state.board.source !== 'turn' &&
+      !previousComplete
     return {
       ...state,
-      board: previousComplete ? turnBoard(nextGoal, event.time, 'in_progress', '') : state.board,
-      taskSeen: previousComplete ? true : state.taskSeen,
+      board: preserve ? state.board : turnBoard(nextGoal, event.time, 'in_progress', ''),
+      taskSeen: preserve ? state.taskSeen : true,
       goal: state.goal || nextGoal,
       turnGoal: nextGoal,
       turnStartedAt: event.time,
@@ -222,6 +273,13 @@ export function fold(state, event) {
   if (event.type === 'assistant/message') {
     const assistantText = text(textFromContent(event.data?.message?.content), MAX_RESULT)
     if (assistantText === '') return state
+    if (state.board?.source === 'turn') {
+      return {
+        ...state,
+        assistantText,
+        board: { ...state.board, summary: '正在整理结果', updatedAt: event.time },
+      }
+    }
     return { ...state, assistantText }
   }
 
@@ -293,6 +351,82 @@ export function fold(state, event) {
     }
   }
 
+  if (
+    event.type === 'tool/call' &&
+    event.data?.name !== 'task_progress' &&
+    event.data?.name !== 'todo_write' &&
+    !state.turnHadBoard &&
+    (state.board === null || state.board.source === 'turn')
+  ) {
+    let args = {}
+    try {
+      args = JSON.parse(event.data.arguments)
+    } catch {
+      /* tool arguments may be absent or still streaming; the label alone is enough */
+    }
+    const title = toolTitle(event.data.name, args)
+    const callId = text(event.data.callId, 100)
+    const id = callId === '' ? `tool-${event.seq ?? event.time}` : `tool-${callId}`
+    const previous = state.board?.source === 'turn' ? state.board.tasks.filter((task) => task.id !== 'turn') : []
+    const tasks = capFallbackTasks([
+      ...previous,
+      { id, title, status: 'in_progress', detail: '', result: '' },
+    ])
+    const goal = state.turnGoal || state.board?.goal || '当前任务'
+    return {
+      ...state,
+      board: {
+        goal,
+        summary: `正在执行：${title}`,
+        tasks,
+        updatedAt: event.time,
+        source: 'turn',
+        auto: false,
+      },
+      taskSeen: true,
+      goal: state.goal || goal,
+    }
+  }
+
+  if (
+    event.type === 'tool/result' &&
+    !state.turnHadBoard &&
+    state.board?.source === 'turn'
+  ) {
+    const callId = text(
+      event.data?.message?.toolCallId ??
+        event.data?.message?.source?.callId ??
+        event.data?.callId,
+      100
+    )
+    if (callId === '') return state
+    const id = `tool-${callId}`
+    let found = false
+    const failed =
+      event.data?.message?.isError === true ||
+      event.data?.isError === true ||
+      Boolean(event.data?.error)
+    const tasks = state.board.tasks.map((task) => {
+      if (task.id !== id) return task
+      found = true
+      return {
+        ...task,
+        status: failed ? 'pending' : 'completed',
+        result: failed ? '执行失败' : task.result || '已完成',
+      }
+    })
+    if (!found) return state
+    return {
+      ...state,
+      board: {
+        ...state.board,
+        summary: failed ? '有步骤失败，继续处理' : '正在整理结果',
+        tasks,
+        updatedAt: event.time,
+      },
+    }
+  }
+
   if (event.type === 'turn/end' && !state.turnHadBoard) {
     const active =
       state.board !== null &&
@@ -303,6 +437,40 @@ export function fold(state, event) {
     const result = state.assistantText || (completed ? '本轮已完成。' : '本轮未完成。')
     const goal = state.turnGoal || state.board?.goal || ''
     if (goal === '') return state
+
+    const hasActivity =
+      state.board?.source === 'turn' &&
+      state.board.tasks.some((task) => task.id !== 'turn')
+    if (hasActivity) {
+      const tasks = state.board.tasks
+        .filter((task) => task.id !== 'turn')
+        .map((task) => ({
+          ...task,
+          status: completed ? 'completed' : task.status === 'completed' ? 'completed' : 'pending',
+          result: task.result || (completed ? '已完成' : '本轮未完成'),
+        }))
+      if (state.assistantText !== '') {
+        tasks.push({
+          id: 'answer',
+          title: '整理结果',
+          status: completed ? 'completed' : 'pending',
+          detail: '',
+          result: state.assistantText,
+        })
+      }
+      return {
+        ...state,
+        board: {
+          ...state.board,
+          goal,
+          summary: completed ? '本轮已完成' : '本轮未完成',
+          tasks: capFallbackTasks(tasks),
+          updatedAt: event.time,
+        },
+        taskSeen: true,
+      }
+    }
+
     return {
       ...state,
       board: turnBoard(goal, event.time, completed ? 'completed' : 'pending', result),
@@ -451,7 +619,7 @@ export async function apply(ctx) {
       viewSchema,
       view: (state) => state.board,
     },
-    stateVersion: 2,
+    stateVersion: 3,
   })
 
   ctx.tools.register(taskProgressTool)
@@ -460,6 +628,6 @@ export async function apply(ctx) {
     name: 'task-progress',
     order: 900,
     text:
-      'For a request that needs more than two concrete steps, maintain the visual task board with `task_progress`: call it once before starting with the full goal and 3–8 concrete stages, then resend the complete board whenever a stage changes status or produces a result. Put user-visible stage results in `result`. If `todo_write` is available, use it only for private scratch planning when no visual progress board is wanted.',
+      'At the start of every user turn that requires work, call `task_progress` before the first non-task tool, with the full goal and 3–8 concrete stages derived from that turn. Do not rely on the automatic fallback: without your call the board can only show generic tool activity. Resend the complete board whenever a stage changes status or produces a result; put user-visible stage results in `result`. Skip the board only for a purely conversational reply. If `todo_write` is available, use it only for private scratch planning.',
   })
 }

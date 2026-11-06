@@ -355,9 +355,17 @@ apply(state, event):
     → 合法：board = normalized.board；turnHadBoard = true
     → clear：board = null；turnHadBoard = true
     → 非法：忽略
+  tool/call 其他工具且本轮没有显式看板
+    → 从工具名与参数生成阶段（读取/搜索/运行/修改等），source=turn
+    → 第一个工具调用替换“处理本轮请求”占位；最多保留 8 条
+  tool/result
+    → 把对应工具阶段标记为 completed（失败则 pending），result=已完成/执行失败
+  assistant/message
+    → 记录本轮最后一条助手文本；source=turn 时摘要变为“正在整理结果”
   turn/end 且本轮没有看板更新
     → 若上一看板仍在进行且不是本轮占位板：保留
-    → 否则 board = 本轮回退板（1 条记录，completed/pending，result = 助手文本）
+    → 有工具阶段：全部收敛为 completed/pending，并追加“整理结果”（result=助手文本）
+    → 没有工具阶段：board = 1 条本轮记录
   其他事件
     → 原样返回 state
 ```
@@ -368,8 +376,8 @@ apply(state, event):
 - 只依赖已提交的 Session 事件；不订阅 `session/event` 做二次扫描。
 - `wire.view` 只返回 `board`，Client 不需要理解内部 `turnHadBoard`。
 - 旧看板/错误参数不会让整个 Session 打不开；`normalize` 失败时直接忽略。
-- `stateVersion: 2`；改字段或折叠语义时递增，缓存检查点会失效重算。
-- 每轮自动回退只有一条“处理本轮请求”，这是为了不让旧看板跨轮次变脏；完整阶段仍由 `task_progress` 提供。
+- `stateVersion: 3`；改字段或折叠语义时递增，缓存检查点会失效重算。
+- 每轮自动回退优先使用工具活动，至少让用户看到“读取/搜索/运行/修改”等真实工作，而不是只有一个“处理本轮请求”；完整阶段仍由 `task_progress` 提供。
 
 ### 6.4 Client 状态
 
@@ -511,7 +519,7 @@ plugin_manager remove_bundle target = @local/dsh-task-progress
 - 悬浮卡位置固定（右上），不做拖拽；系统窗口之外的独立面板需要 Native 能力，当前不支持。
 - 没有截到最终 5/5 悬浮态：验证过程中桌面窗口被关闭；5/5 内容由服务端渲染测试覆盖。
 - “自动拆解”的领域质量取决于模型提交的 tasks；省略 tasks 时是通用五阶段，不是领域推理。
-- 未调用 `task_progress`/`todo_write` 的轮次，自动回退只有一条“处理本轮请求”；完整阶段仍需 Agent 调用工具。
+- 未调用 `task_progress`/`todo_write` 的轮次，自动回退会把本轮工具活动转成阶段；没有工具活动时仍只有一条“处理本轮请求”。完整语义阶段仍需 Agent 调用工具。
 - 如果上一轮看板仍有进行中阶段，新一轮用户消息不会强制重置，避免丢掉正在执行的进度；本轮结束也不回退覆盖。
 - 未实现用户手动编辑任务状态；这是有意的 MVP 边界。
 
